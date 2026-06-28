@@ -268,6 +268,33 @@ if dff.empty:
 st.markdown("# Sales Intelligence Dashboard")
 
 st.markdown("---")
+# ══════════════════════════════════════════════════════════════════════════════
+# RFM SEGMENTATION — computed from filtered completed orders
+# ══════════════════════════════════════════════════════════════════════════════
+analysis_date = dff["date_commande"].max() + pd.Timedelta(days=1)
+
+rfm = (
+    dff.groupby("id_client")
+    .agg(
+        Recency=("date_commande", lambda x: (analysis_date - x.max()).days),
+        Frequency=("id_commande_anon", "nunique"),
+        Monetary=("montant_da", "sum"),
+        Wilaya=("wilaya", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+        Type=("type_client", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+        Favorite_Category=("categorie_produit", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+    )
+    .reset_index()
+)
+
+def assign_rfm_segment(row):
+    if row["Frequency"] >= 10 and row["Monetary"] >= rfm["Monetary"].quantile(0.90) and row["Recency"] <= rfm["Recency"].quantile(0.35):
+        return "🟢 Champions"
+    elif row["Recency"] <= rfm["Recency"].quantile(0.65):
+        return "🟡 Occasional Customers"
+    else:
+        return "🔴 Low-Engagement Customers"
+
+rfm["RFM Segment"] = rfm.apply(assign_rfm_segment, axis=1)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
@@ -570,18 +597,148 @@ with tab2:
 with tab3:
 
     # ── KPIs ──────────────────────────────────────────────────────────────────
-    at_risk = df_loyalty[df_loyalty["Retention Level"] == "Low"]
-    ltv_at_risk = at_risk["total_spent"].sum()
-    n_at_risk   = len(at_risk)
-    pct_at_risk = n_at_risk / len(df_loyalty) * 100 if len(df_loyalty) > 0 else 0
+    low_retention = df_loyalty[df_loyalty["Retention Level"] == "Low"].copy()
+    ltv_low_retention = low_retention["total_spent"].sum()
+    n_low_retention = len(low_retention)
+    pct_low_retention = (
+        n_low_retention / len(df_loyalty) * 100 if len(df_loyalty) > 0 else 0
+    )
 
     ck1, ck2, ck3, ck4 = st.columns(4)
-    ck1.metric("Total Clients",      f"{df_loyalty.shape[0]:,}")
-    ck2.metric("At-Risk Clients",    f"{n_at_risk:,}",
-               delta=f"{pct_at_risk:.1f}% of base", delta_color="inverse")
-    ck3.metric("LTV at Risk",        f"{ltv_at_risk/1e6:.2f}M DA",
-               delta="requires immediate action", delta_color="inverse")
-    ck4.metric("Avg Retention Score",f"{df_loyalty['Retention Score'].mean():.2f}")
+    ck1.metric("Total Clients", f"{df_loyalty.shape[0]:,}")
+    ck2.metric(
+        "Low-Retention Clients",
+        f"{n_low_retention:,}",
+        delta=f"{pct_low_retention:.1f}% of base",
+        delta_color="inverse",
+    )
+    ck3.metric(
+        "Potential LTV to Recover",
+        f"{ltv_low_retention/1e6:.2f}M DA",
+        delta="reactivation opportunity",
+        delta_color="inverse",
+    )
+    ck4.metric(
+        "Avg Retention Score",
+        f"{df_loyalty['Retention Score'].mean():.2f}",
+    )
+
+    st.markdown("---")
+
+    # ── RFM SEGMENTATION ──────────────────────────────────────────────────────
+    st.markdown(
+        '<p class="section-label">RFM customer segmentation</p>',
+        unsafe_allow_html=True,
+    )
+
+    rfm_counts = rfm["RFM Segment"].value_counts().reset_index()
+    rfm_counts.columns = ["Segment", "Clients"]
+
+    col_rfm1, col_rfm2 = st.columns([1, 1])
+
+    with col_rfm1:
+        fig_rfm = px.pie(
+            rfm_counts,
+            values="Clients",
+            names="Segment",
+            hole=0.5,
+            color="Segment",
+            color_discrete_map={
+                "🟢 Champions": C["success"],
+                "🟡 Occasional Customers": C["accent"],
+                "🔴 Low-Engagement Customers": C["danger"],
+            },
+        )
+        fig_rfm.update_traces(textposition="outside", textinfo="percent+label")
+        fig_rfm.update_layout(**PLOT, showlegend=False, height=300)
+        st.plotly_chart(fig_rfm, use_container_width=True)
+
+    with col_rfm2:
+        rfm_summary = (
+            rfm.groupby("RFM Segment")
+            .agg(
+                Clients=("id_client", "count"),
+                Avg_Recency=("Recency", "mean"),
+                Avg_Frequency=("Frequency", "mean"),
+                Avg_Monetary=("Monetary", "mean"),
+            )
+            .reset_index()
+        )
+
+        rfm_summary["Avg_Recency"] = rfm_summary["Avg_Recency"].round(0)
+        rfm_summary["Avg_Frequency"] = rfm_summary["Avg_Frequency"].round(1)
+        rfm_summary["Avg_Monetary"] = rfm_summary["Avg_Monetary"].apply(
+            lambda x: f"{x:,.0f} DA"
+        )
+
+        st.dataframe(rfm_summary, use_container_width=True, height=260)
+
+    st.markdown("---")
+
+    # ── RFM CUSTOMER ACTION LIST ───────────────────────────────────────────────
+    st.markdown(
+        '<p class="section-label">Customer action list — based on RFM segment</p>',
+        unsafe_allow_html=True,
+    )
+
+    rfm_actions = rfm.copy()
+
+    rfm_actions["Recommended Action"] = rfm_actions["RFM Segment"].map(
+        {
+            "🟢 Champions": "VIP retention: exclusive offers + priority service",
+            "🟡 Occasional Customers": "Increase frequency: reminder campaign + product recommendation",
+            "🔴 Low-Engagement Customers": "Reactivation: limited-time offer, then reduce marketing spend if inactive",
+        }
+    )
+
+    rfm_display = rfm_actions[
+        [
+            "id_client",
+            "Wilaya",
+            "Type",
+            "Favorite_Category",
+            "Recency",
+            "Frequency",
+            "Monetary",
+            "RFM Segment",
+            "Recommended Action",
+        ]
+    ].rename(
+        columns={
+            "id_client": "Client",
+            "Favorite_Category": "Top Category",
+            "Recency": "Days Since Last Purchase",
+            "Frequency": "Orders",
+            "Monetary": "Total Spend (DA)",
+        }
+    )
+
+    rfm_display["Total Spend (DA)"] = rfm_display["Total Spend (DA)"].apply(
+        lambda x: f"{x:,.0f}"
+    )
+
+    st.dataframe(rfm_display, use_container_width=True, height=330)
+
+    st.download_button(
+        "⬇ Export RFM customer action list",
+        rfm_display.to_csv(index=False).encode(),
+        "rfm_customer_actions.csv",
+        "text/csv",
+    )
+
+    # ── SO WHAT — RFM ─────────────────────────────────────────────────────────
+    champions = rfm[rfm["RFM Segment"] == "🟢 Champions"]
+    occasional = rfm[rfm["RFM Segment"] == "🟡 Occasional Customers"]
+    low_engagement = rfm[rfm["RFM Segment"] == "🔴 Low-Engagement Customers"]
+
+    st.markdown(
+        f'<div class="so-what">💡 <b>RFM insight:</b> '
+        f'<b>{len(champions)}</b> Champions should receive VIP retention actions. '
+        f'<b>{len(occasional)}</b> Occasional Customers are the main growth opportunity. '
+        f'<b>{len(low_engagement)}</b> Low-Engagement Customers should receive a reactivation campaign, '
+        f'then reduced marketing spend if they remain inactive.</div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
 
@@ -589,109 +746,191 @@ with tab3:
     col_e, col_f = st.columns([1, 1])
 
     with col_e:
-        st.markdown('<p class="section-label">B2B vs B2C — revenue split</p>', unsafe_allow_html=True)
-        seg = dff.groupby("type_client").agg(
-            revenue=("montant_da", "sum"),
-            clients=("id_client", "nunique"),
-            avg_order=("montant_da", "mean"),
-        ).reset_index()
-        fig_seg = px.bar(seg, x="type_client", y="revenue",
-                         color="type_client", color_discrete_sequence=[C["primary"], C["accent"]],
-                         text=seg["revenue"].apply(lambda x: f"{x/1e6:.1f}M DA"),
-                         labels={"revenue": "Revenue (DA)", "type_client": ""})
+        st.markdown(
+            '<p class="section-label">B2B vs B2C — revenue split</p>',
+            unsafe_allow_html=True,
+        )
+
+        seg = (
+            dff.groupby("type_client")
+            .agg(
+                revenue=("montant_da", "sum"),
+                clients=("id_client", "nunique"),
+                avg_order=("montant_da", "mean"),
+            )
+            .reset_index()
+        )
+
+        fig_seg = px.bar(
+            seg,
+            x="type_client",
+            y="revenue",
+            color="type_client",
+            color_discrete_sequence=[C["primary"], C["accent"]],
+            text=seg["revenue"].apply(lambda x: f"{x/1e6:.1f}M DA"),
+            labels={"revenue": "Revenue (DA)", "type_client": ""},
+        )
         fig_seg.update_traces(textposition="outside")
-        fig_seg.update_layout(**PLOT, showlegend=False, height=280,
-                              xaxis=dict(showgrid=False), yaxis=dict(gridcolor=C["border"]))
+        fig_seg.update_layout(
+            **PLOT,
+            showlegend=False,
+            height=280,
+            xaxis=dict(showgrid=False),
+            yaxis=dict(gridcolor=C["border"]),
+        )
         st.plotly_chart(fig_seg, use_container_width=True)
 
     with col_f:
-        st.markdown('<p class="section-label">New vs returning clients — revenue over time</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="section-label">New vs returning clients — revenue over time</p>',
+            unsafe_allow_html=True,
+        )
+
         cohort = dff.copy()
         cohort["period"] = cohort["date_commande"].dt.to_period("M").dt.to_timestamp()
-        cohort_agg = cohort.groupby(["period", "nouveau_ou_fidele"])["montant_da"].sum().reset_index()
-        fig_cohort = px.line(cohort_agg, x="period", y="montant_da",
-                             color="nouveau_ou_fidele",
-                             color_discrete_sequence=[C["primary"], C["accent"]],
-                             markers=True,
-                             labels={"montant_da": "Revenue (DA)", "period": "",
-                                     "nouveau_ou_fidele": "Client type"})
-        fig_cohort.update_layout(**PLOT, height=280,
-                                 legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
-                                 xaxis=dict(showgrid=False), yaxis=dict(gridcolor=C["border"]))
+
+        cohort_agg = (
+            cohort.groupby(["period", "nouveau_ou_fidele"])["montant_da"]
+            .sum()
+            .reset_index()
+        )
+
+        fig_cohort = px.line(
+            cohort_agg,
+            x="period",
+            y="montant_da",
+            color="nouveau_ou_fidele",
+            color_discrete_sequence=[C["primary"], C["accent"]],
+            markers=True,
+            labels={
+                "montant_da": "Revenue (DA)",
+                "period": "",
+                "nouveau_ou_fidele": "Client type",
+            },
+        )
+        fig_cohort.update_layout(
+            **PLOT,
+            height=280,
+            legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
+            xaxis=dict(showgrid=False),
+            yaxis=dict(gridcolor=C["border"]),
+        )
         st.plotly_chart(fig_cohort, use_container_width=True)
 
     st.markdown("---")
 
-    # ── Retention distribution ─────────────────────────────────────────────────
+    # ── RETENTION MODEL OUTPUT ────────────────────────────────────────────────
     col_g, col_h = st.columns([1, 1])
 
     with col_g:
-        st.markdown('<p class="section-label">Retention level breakdown</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<p class="section-label">Retention model — level breakdown</p>',
+            unsafe_allow_html=True,
+        )
+
         ret_counts = df_loyalty["Retention Level"].value_counts().reset_index()
         ret_counts.columns = ["level", "count"]
-        color_map  = {"High": C["success"], "Medium": C["accent"], "Low": C["danger"]}
-        fig_ret_pie = px.pie(ret_counts, values="count", names="level",
-                             hole=0.55, color="level", color_discrete_map=color_map)
+
+        color_map = {
+            "High": C["success"],
+            "Medium": C["accent"],
+            "Low": C["danger"],
+        }
+
+        fig_ret_pie = px.pie(
+            ret_counts,
+            values="count",
+            names="level",
+            hole=0.55,
+            color="level",
+            color_discrete_map=color_map,
+        )
         fig_ret_pie.update_traces(textposition="outside", textinfo="percent+label")
         fig_ret_pie.update_layout(**PLOT, showlegend=False, height=260)
         st.plotly_chart(fig_ret_pie, use_container_width=True)
 
     with col_h:
-        st.markdown('<p class="section-label">Retention score distribution</p>', unsafe_allow_html=True)
-        fig_hist = px.histogram(df_loyalty, x="Retention Score", nbins=30,
-                                color_discrete_sequence=[C["primary"]])
-        fig_hist.update_layout(**PLOT, height=260,
-                               xaxis=dict(showgrid=False), yaxis=dict(gridcolor=C["border"]))
+        st.markdown(
+            '<p class="section-label">Retention score distribution</p>',
+            unsafe_allow_html=True,
+        )
+
+        fig_hist = px.histogram(
+            df_loyalty,
+            x="Retention Score",
+            nbins=30,
+            color_discrete_sequence=[C["primary"]],
+        )
+        fig_hist.update_layout(
+            **PLOT,
+            height=260,
+            xaxis=dict(showgrid=False),
+            yaxis=dict(gridcolor=C["border"]),
+        )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-    st.markdown("---")
+    # ── LOW-RETENTION EXPORT ──────────────────────────────────────────────────
+    if not low_retention.empty:
+        st.markdown("---")
+        st.markdown(
+            '<p class="section-label">Low-retention clients — retention model output</p>',
+            unsafe_allow_html=True,
+        )
 
-    # ── At-risk client table ───────────────────────────────────────────────────
-    st.markdown('<p class="section-label">⚠️ At-risk clients — Low retention (sorted by LTV)</p>',
-                unsafe_allow_html=True)
+        low_display_cols = [
+            "id_client",
+            "wilaya",
+            "type_client",
+            "favorite_category",
+            "total_orders",
+            "total_spent",
+            "days_since_last_order",
+            "Retention Score",
+            "Recommended Strategy",
+        ]
 
-    at_risk_display = (
-        at_risk
-        .sort_values("total_spent", ascending=False)
-        [[
-            "id_client", "wilaya", "type_client", "favorite_category",
-            "total_orders", "total_spent", "days_since_last_order",
-            "Retention Score", "Recommended Strategy"
-        ]]
-        .rename(columns={
-            "id_client":            "Client",
-            "wilaya":               "Wilaya",
-            "type_client":          "Type",
-            "favorite_category":    "Top Category",
-            "total_orders":         "Orders",
-            "total_spent":          "LTV (DA)",
-            "days_since_last_order":"Days Inactive",
-            "Retention Score":      "Score",
-            "Recommended Strategy": "Strategy",
-        })
-        .reset_index(drop=True)
-    )
-    at_risk_display["LTV (DA)"]  = at_risk_display["LTV (DA)"].apply(lambda x: f"{x:,.0f}")
-    at_risk_display["Score"]     = at_risk_display["Score"].apply(lambda x: f"{x:.2f}")
+        available_cols = [
+            col for col in low_display_cols if col in low_retention.columns
+        ]
 
-    st.dataframe(at_risk_display, use_container_width=True, height=320)
+        low_display = (
+            low_retention[available_cols]
+            .sort_values(
+                "total_spent",
+                ascending=False,
+            )
+            .rename(
+                columns={
+                    "id_client": "Client",
+                    "wilaya": "Wilaya",
+                    "type_client": "Type",
+                    "favorite_category": "Top Category",
+                    "total_orders": "Orders",
+                    "total_spent": "LTV (DA)",
+                    "days_since_last_order": "Days Inactive",
+                    "Retention Score": "Score",
+                    "Recommended Strategy": "Strategy",
+                }
+            )
+            .reset_index(drop=True)
+        )
 
-    # ── So what — Clients ─────────────────────────────────────────────────────
-    top_at_risk_cat = at_risk["favorite_category"].value_counts().idxmax() if len(at_risk) > 0 else "—"
-    st.markdown(
-        f'<div class="so-what">💡 <b>{n_at_risk} clients</b> are at risk of churning, '
-        f'representing <b>{ltv_at_risk/1e6:.2f}M DA</b> in potential lost revenue. '
-        f'The most common category among at-risk clients is <b>{top_at_risk_cat}</b>. '
-        f'A targeted win-back campaign for these clients should be the first commercial priority.</div>',
-        unsafe_allow_html=True
-    )
+        if "LTV (DA)" in low_display.columns:
+            low_display["LTV (DA)"] = low_display["LTV (DA)"].apply(
+                lambda x: f"{x:,.0f}"
+            )
 
-    st.markdown("---")
-    st.download_button(
-        "⬇ Export at-risk clients",
-        at_risk_display.to_csv(index=False).encode(),
-        "at_risk_clients.csv", "text/csv"
-    )
+        if "Score" in low_display.columns:
+            low_display["Score"] = low_display["Score"].apply(lambda x: f"{x:.2f}")
+
+        st.dataframe(low_display, use_container_width=True, height=300)
+
+        st.download_button(
+            "⬇ Export low-retention clients",
+            low_display.to_csv(index=False).encode(),
+            "low_retention_clients.csv",
+            "text/csv",
+        )
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — ALERTS (Chaudière Winter Restock)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1013,34 +1252,7 @@ with tab4:
 
     st.markdown("---")
 
-    # ── STOCK STATUS ──────────────────────────────────────────────────────────
-    if "statut_stock" in dff.columns:
-        st.markdown('<p class="section-label">Stock status distribution</p>',
-                    unsafe_allow_html=True)
-
-        col_s1, col_s2 = st.columns([1, 1])
-
-        with col_s1:
-            stock_counts = dff.groupby("statut_stock")["produit"].nunique().reset_index()
-            stock_counts.columns = ["statut", "count"]
-            stock_color_map = {"Disponible": C["success"], "Rupture": C["danger"], "Sur commande": C["accent"]}
-            fig_stock_pie = px.pie(stock_counts, values="count", names="statut", hole=0.55,
-                                   color="statut", color_discrete_map=stock_color_map)
-            fig_stock_pie.update_traces(textposition="outside", textinfo="percent+label")
-            fig_stock_pie.update_layout(**PLOT, showlegend=False, height=300)
-            st.plotly_chart(fig_stock_pie, use_container_width=True)
-
-        with col_s2:
-            stock_rev = dff.groupby("statut_stock").agg(
-                revenue=("montant_da", "sum"), products=("produit", "nunique")
-            ).reset_index()
-            fig_stock_bar = px.bar(stock_rev, x="statut_stock", y="revenue",
-                                   color="statut_stock", color_discrete_map=stock_color_map,
-                                   text=stock_rev["revenue"].apply(lambda x: f"{x/1e6:.1f}M"))
-            fig_stock_bar.update_traces(textposition="outside")
-            fig_stock_bar.update_layout(**PLOT, showlegend=False, height=300,
-                                        xaxis=dict(showgrid=False), yaxis=dict(gridcolor=C["border"]))
-            st.plotly_chart(fig_stock_bar, use_container_width=True)
+    
     # ── So what — Products ────────────────────────────────────────────────────
     top_margin_cat = margin_df.loc[margin_df["avg_margin"].idxmax(), "categorie_produit"] \
         if "marge_estimee_pct" in dff.columns else "—"
